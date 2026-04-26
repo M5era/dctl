@@ -1,0 +1,230 @@
+//==========================================================================================
+// YEDLIN GRAIN - HYBRID PARTICLE EMULSION v3.1
+//==========================================================================================
+// Combines point-based stochastic noise with subtle domain warping.
+// Achieves film-like particulate character without digital pattern artifacts.
+// v3.1: Added grit layer, tuned defaults to match Yedlin reference.
+//==========================================================================================
+
+// --- UI CONTROLS ---
+DEFINE_UI_PARAMS(grain_amount, Grain Amount, DCTLUI_SLIDER_FLOAT, 0.25, 0.0, 1.0, 0.01)
+DEFINE_UI_PARAMS(grain_size, Grain Size, DCTLUI_SLIDER_FLOAT, 0.6, 0.2, 4.0, 0.05)
+DEFINE_UI_PARAMS(grit, Grit, DCTLUI_SLIDER_FLOAT, 0.4, 0.0, 1.0, 0.01)
+DEFINE_UI_PARAMS(chroma_separation, Chroma Separation, DCTLUI_SLIDER_FLOAT, 0.3, 0.0, 1.0, 0.01)
+DEFINE_UI_PARAMS(highlight_protection, Highlight Protection, DCTLUI_SLIDER_FLOAT, 0.6, 0.0, 1.0, 0.01)
+DEFINE_UI_PARAMS(shadow_response, Shadow Response, DCTLUI_SLIDER_FLOAT, 0.4, 0.0, 1.0, 0.01)
+DEFINE_UI_PARAMS(seed, Seed, DCTLUI_SLIDER_FLOAT, 0.0, 0.0, 1000.0, 1.0)
+
+// --- CONSTANTS ---
+#define PI 3.14159265359f
+
+// --- BASIC MATH ---
+__DEVICE__ float frac(float x) {
+    return x - _floor(x);
+}
+
+__DEVICE__ float mix(float a, float b, float t) {
+    return a + t * (b - a);
+}
+
+//==========================================================================================
+// HASH FUNCTIONS - Fast pseudo-random number generation
+//==========================================================================================
+
+// High quality 2D->1D hash for per-pixel noise
+__DEVICE__ float hash21(float2 p, float sd) {
+    float3 p3 = make_float3(
+        frac(p.x * 0.1031f + sd * 0.0013f),
+        frac(p.y * 0.1030f - sd * 0.0021f),
+        frac((p.x + p.y) * 0.0973f + sd * 0.0019f)
+    );
+    float dot_val = p3.x * (p3.y + 33.33f) + p3.y * (p3.z + 33.33f) + p3.z * (p3.x + 33.33f);
+    p3.x += dot_val;
+    p3.y += dot_val;
+    return frac((p3.x + p3.y) * p3.z) * 2.0f - 1.0f;
+}
+
+// Per-pixel hash (no interpolation) - for grit layer
+__DEVICE__ float pixelHash(int x, int y, float sd) {
+    float p = (float)x * 0.1031f + (float)y * 0.1030f + sd * 0.0017f;
+    p = frac(p) * 127.1f;
+    p = frac(p * p) * 43758.5453f;
+    return frac(p) * 2.0f - 1.0f;
+}
+
+// 2D to 2D hash - produces displacement vector
+__DEVICE__ float2 hash22(float2 p, float sd) {
+    float n = hash21(p, sd);
+    float m = hash21(make_float2(p.y + 127.1f, p.x + 311.7f), sd + 47.0f);
+    return make_float2(n, m);
+}
+
+//==========================================================================================
+// VALUE NOISE - Point-based, no swirl artifacts
+//==========================================================================================
+
+__DEVICE__ float valueNoise(float2 p, float sd, float sharpness) {
+    float2 i = make_float2(_floor(p.x), _floor(p.y));
+    float2 f = make_float2(frac(p.x), frac(p.y));
+    
+    // Adjustable interpolation sharpness
+    // sharpness 0 = linear (sharp), sharpness 1 = smooth cubic
+    float2 u_linear = f;
+    float2 u_smooth = make_float2(f.x * f.x * (3.0f - 2.0f * f.x), f.y * f.y * (3.0f - 2.0f * f.y));
+    float2 u = make_float2(
+        mix(u_linear.x, u_smooth.x, sharpness),
+        mix(u_linear.y, u_smooth.y, sharpness)
+    );
+    
+    // Sample 4 corners with random values
+    float a = hash21(i, sd);
+    float b = hash21(make_float2(i.x + 1.0f, i.y), sd);
+    float c = hash21(make_float2(i.x, i.y + 1.0f), sd);
+    float d = hash21(make_float2(i.x + 1.0f, i.y + 1.0f), sd);
+    
+    // Bilinear interpolation
+    return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
+}
+
+//==========================================================================================
+// MULTI-SCALE GRAIN - Fine texture with subtle clumping
+//==========================================================================================
+
+__DEVICE__ float multiScaleGrain(float2 p, float sd, float gritAmount) {
+    // Primary fine grain layer
+    float fine = valueNoise(p, sd, 0.3f);  // Fairly sharp interpolation
+    
+    // Secondary clumping layer (lower frequency, subtle)
+    float2 p2 = make_float2(p.x * 0.4f + 17.3f, p.y * 0.4f + 31.7f);
+    float clump = valueNoise(p2, sd + 73.0f, 0.7f);  // Smoother
+    
+    // Modulate fine grain by clump pattern (creates density variation)
+    float modulated = fine * (0.7f + clump * 0.3f);
+    
+    // Blend based on grit - higher grit = more fine detail
+    return mix(modulated * 0.8f, fine, gritAmount * 0.5f);
+}
+
+//==========================================================================================
+// GRIT LAYER - Pure per-pixel noise for texture
+//==========================================================================================
+
+__DEVICE__ float gritNoise(int x, int y, float sd, float size) {
+    // Sample at scaled coordinates for size control
+    int sx = (int)((float)x / _fmaxf(size, 0.2f));
+    int sy = (int)((float)y / _fmaxf(size, 0.2f));
+    return pixelHash(sx, sy, sd);
+}
+
+//==========================================================================================
+// SUBTLE WARP - Rotated to avoid axis-aligned banding
+//==========================================================================================
+
+__DEVICE__ float2 subtleWarp(float2 p, float sd, float amount) {
+    // Rotate coordinates ~31 degrees to break vertical/horizontal alignment
+    const float rot_cos = 0.857f;
+    const float rot_sin = 0.515f;
+    float2 rotP = make_float2(
+        p.x * rot_cos - p.y * rot_sin,
+        p.x * rot_sin + p.y * rot_cos
+    );
+    
+    // Asymmetric frequency to avoid grid patterns
+    float2 warpCoord = make_float2(rotP.x * 0.031f, rotP.y * 0.053f);
+    
+    float2 i = make_float2(_floor(warpCoord.x), _floor(warpCoord.y));
+    float2 f = make_float2(frac(warpCoord.x), frac(warpCoord.y));
+    float2 u = make_float2(f.x * f.x * (3.0f - 2.0f * f.x), f.y * f.y * (3.0f - 2.0f * f.y));
+    
+    float2 offset  = hash22(i, sd + 500.0f);
+    float2 offset2 = hash22(make_float2(i.x + 1.0f, i.y), sd + 500.0f);
+    float2 offset3 = hash22(make_float2(i.x, i.y + 1.0f), sd + 500.0f);
+    float2 offset4 = hash22(make_float2(i.x + 1.0f, i.y + 1.0f), sd + 500.0f);
+    
+    float ox = mix(mix(offset.x, offset2.x, u.x), mix(offset3.x, offset4.x, u.x), u.y);
+    float oy = mix(mix(offset.y, offset2.y, u.x), mix(offset3.y, offset4.y, u.x), u.y);
+    
+    return make_float2(p.x + ox * amount, p.y + oy * amount);
+}
+
+//==========================================================================================
+// SIGNAL-DEPENDENT RESPONSE (Yedlin-style)
+//==========================================================================================
+
+__DEVICE__ float grainResponse(float luma, float shadowResp, float hiProtect) {
+    // Shadow toe: grain needs some exposure to form
+    // Based on Yedlin reference: grain visible in shadows but fades in deep black
+    float toePower = mix(0.25f, 0.7f, shadowResp);
+    float shadowGain = _powf(_clampf(luma, 0.001f, 1.0f), toePower);
+    
+    // Highlight protection: grain blows out in highlights
+    // Yedlin ref shows grain fading around 0.6-0.7 luminance
+    float shoulderStart = mix(0.85f, 0.45f, hiProtect);
+    float shoulderRange = 1.0f - shoulderStart;
+    float highlightPos = _clampf((luma - shoulderStart) / _fmaxf(shoulderRange, 0.01f), 0.0f, 1.0f);
+    float highlightFade = 1.0f - highlightPos * highlightPos;  // Quadratic falloff
+    
+    // Peak response in mid-tones
+    return shadowGain * highlightFade;
+}
+
+//==========================================================================================
+// MAIN TRANSFORM
+//==========================================================================================
+
+__DEVICE__ float3 transform(int p_Width, int p_Height, int p_X, int p_Y, float p_R, float p_G, float p_B) {
+    
+    // 1. Calculate UV coordinates based on grain size
+    float scale = 1.0f / _fmaxf(grain_size, 0.1f);
+    float2 uv = make_float2((float)p_X * scale, (float)p_Y * scale);
+    
+    // 2. Apply subtle warp to break grid
+    float2 warpedUV = subtleWarp(uv, seed, 0.6f);
+    
+    // 3. Calculate luma and grain response
+    float luma = 0.2126f * p_R + 0.7152f * p_G + 0.0722f * p_B;
+    float response = grainResponse(luma, shadow_response, highlight_protection);
+    
+    // 4. Generate structured grain for each channel
+    float chromaOffset = chroma_separation * 1.2f;
+    
+    float grainR = multiScaleGrain(warpedUV, seed, grit);
+    float grainG = multiScaleGrain(
+        make_float2(warpedUV.x + chromaOffset, warpedUV.y + chromaOffset * 0.7f), 
+        seed + 47.0f, 
+        grit
+    );
+    float grainB = multiScaleGrain(
+        make_float2(warpedUV.x - chromaOffset * 0.5f, warpedUV.y + chromaOffset * 1.2f), 
+        seed + 113.0f, 
+        grit
+    );
+    
+    // 5. Add per-pixel grit layer for texture
+    float gritR = gritNoise(p_X, p_Y, seed, grain_size);
+    float gritG = gritNoise(p_X, p_Y, seed + 47.0f, grain_size);
+    float gritB = gritNoise(p_X, p_Y, seed + 113.0f, grain_size);
+    
+    // Blend structured grain with grit
+    float gritBlend = grit * 0.4f;  // Grit adds up to 40% of final texture
+    grainR = mix(grainR, grainR * 0.6f + gritR * 0.4f, gritBlend);
+    grainG = mix(grainG, grainG * 0.6f + gritG * 0.4f, gritBlend);
+    grainB = mix(grainB, grainB * 0.6f + gritB * 0.4f, gritBlend);
+    
+    // 6. Mono/color blend based on chroma separation
+    float monoGrain = (grainR + grainG + grainB) * 0.333f;
+    float finalR = mix(monoGrain, grainR, chroma_separation);
+    float finalG = mix(monoGrain, grainG, chroma_separation);
+    float finalB = mix(monoGrain, grainB, chroma_separation);
+    
+    // 7. Scale grain strength with response curve
+    // Increased base multiplier for more visible grain at reasonable settings
+    float strength = grain_amount * 0.18f * response;
+    
+    // 8. Apply grain additively
+    float out_r = p_R + finalR * strength;
+    float out_g = p_G + finalG * strength;
+    float out_b = p_B + finalB * strength;
+    
+    return make_float3(out_r, out_g, out_b);
+}
