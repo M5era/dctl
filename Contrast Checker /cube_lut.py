@@ -1,6 +1,7 @@
 """
 cube_lut.py — Parse and apply .cube LUTs (1D and 3D).
-Mimics Resolve's behaviour: trilinear interpolation, no clamping unless DOMAIN_MIN/MAX.
+Mimics Resolve's behaviour: tetrahedral interpolation for 3D LUTs (matching
+Resolve's default for grading LUTs), no clamping unless DOMAIN_MIN/MAX.
 """
 
 import numpy as np
@@ -89,17 +90,21 @@ class CubeLUT:
             return self._apply_1d(idx)
 
     def _apply_3d(self, idx):
-        """Trilinear interpolation on a 3D cube."""
-        # idx has shape (..., 3) with values in [0, size-1]
+        """
+        Tetrahedral interpolation on a 3D cube — splits each unit cell into 6
+        tetrahedra by sorting (fr, fg, fb), then blends 4 corners per sample.
+        Matches Resolve's default 3D LUT interpolation.
+        """
         i0 = np.floor(idx).astype(np.int64)
         i1 = np.minimum(i0 + 1, self.size - 1)
-        f  = idx - i0  # fractional part, shape (..., 3)
+        f = idx - i0
 
         r0, g0, b0 = i0[..., 0], i0[..., 1], i0[..., 2]
         r1, g1, b1 = i1[..., 0], i1[..., 1], i1[..., 2]
-        fr, fg, fb = f[..., 0:1], f[..., 1:2], f[..., 2:3]
+        fr = f[..., 0:1]
+        fg = f[..., 1:2]
+        fb = f[..., 2:3]
 
-        # 8 corner samples
         c000 = self.data[r0, g0, b0]
         c001 = self.data[r0, g0, b1]
         c010 = self.data[r0, g1, b0]
@@ -109,16 +114,26 @@ class CubeLUT:
         c110 = self.data[r1, g1, b0]
         c111 = self.data[r1, g1, b1]
 
-        # Trilinear blend
-        c00 = c000 * (1 - fb) + c001 * fb
-        c01 = c010 * (1 - fb) + c011 * fb
-        c10 = c100 * (1 - fb) + c101 * fb
-        c11 = c110 * (1 - fb) + c111 * fb
+        # Six tetrahedra dispatched on the sort order of (fr, fg, fb).
+        m1 = (fr >= fg) & (fg >= fb)
+        m2 = (fr >= fb) & (fb >= fg) & ~m1
+        m3 = (fb >= fr) & (fr >= fg) & ~m1 & ~m2
+        m4 = (fb >= fg) & (fg >= fr) & ~m1 & ~m2 & ~m3
+        m5 = (fg >= fb) & (fb >= fr) & ~m1 & ~m2 & ~m3 & ~m4
+        # m6: remaining case (fg >= fr >= fb)
 
-        c0 = c00 * (1 - fg) + c01 * fg
-        c1 = c10 * (1 - fg) + c11 * fg
+        out1 = c000 + fr * (c100 - c000) + fg * (c110 - c100) + fb * (c111 - c110)
+        out2 = c000 + fr * (c100 - c000) + fb * (c101 - c100) + fg * (c111 - c101)
+        out3 = c000 + fb * (c001 - c000) + fr * (c101 - c001) + fg * (c111 - c101)
+        out4 = c000 + fb * (c001 - c000) + fg * (c011 - c001) + fr * (c111 - c011)
+        out5 = c000 + fg * (c010 - c000) + fb * (c011 - c010) + fr * (c111 - c011)
+        out6 = c000 + fg * (c010 - c000) + fr * (c110 - c010) + fb * (c111 - c110)
 
-        out = c0 * (1 - fr) + c1 * fr
+        out = np.where(m1, out1,
+              np.where(m2, out2,
+              np.where(m3, out3,
+              np.where(m4, out4,
+              np.where(m5, out5, out6)))))
         return out
 
     def _apply_1d(self, idx):

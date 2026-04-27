@@ -75,14 +75,14 @@ def main():
         img_disp = gamma_encode_for_display(img)
         Image.fromarray(to_uint8(img_disp)).save(os.path.join(out_dir, f"{name}.png"))
 
-    # Render an additional logexp_density with the K64 datasheet offset applied
-    # so X axis reads as absolute log lux-seconds (anchored to ISO 64 speed point).
+    # Render an additional logexp_density view with the ISO-64 (Kodachrome 64)
+    # speed-point offset, aligning 0 lux-seconds with the X = 0 column.
     print(f"  Rendering logexp_density_k64offset...")
     img = cr.render_chart(
         width, height, transformed,
         stop_min=stop_min, stop_max=stop_max,
         x_mode=cr.X_MODE_LOG_EXPOSURE, y_mode=cr.Y_MODE_DENSITY,
-        datasheet_offset=cr.iso_to_datasheet_offset(64),
+        zero_lux_offset=cr.iso_to_zero_lux_offset(64),
         overlay_height_frac=1.0,
     )
     img_disp = gamma_encode_for_display(img)
@@ -107,6 +107,125 @@ def main():
     )
     img_disp = gamma_encode_for_display(img)
     Image.fromarray(to_uint8(img_disp)).save(os.path.join(out_dir, "bottom_strip_overlay.png"))
+
+    # Kodak-style sensitometry sheet: dual X axes with density on Y.
+    # Render three variants exercising the new toggles.
+    sensi_stop_min, sensi_stop_max = -10.0, 8.0
+    sensi_probe = m.generate_probe_ramp(probe_w, sensi_stop_min, sensi_stop_max)
+    sensi_transformed = lut.apply(sensi_probe)
+    sensi_w, sensi_h = 1920, 1080
+
+    print(f"  Rendering sensitometry_page (clamped, default)...")
+    img_clamped = cr.render_sensitometry_page(
+        sensi_w, sensi_h, sensi_transformed,
+        stop_min=sensi_stop_min, stop_max=sensi_stop_max,
+    )
+    Image.fromarray(to_uint8(img_clamped)).save(
+        os.path.join(out_dir, "sensitometry_page.png"))
+
+    print(f"  Rendering sensitometry_page_full (show_entire_curve=True)...")
+    img_full = cr.render_sensitometry_page(
+        sensi_w, sensi_h, sensi_transformed,
+        stop_min=sensi_stop_min, stop_max=sensi_stop_max,
+        show_entire_curve=True,
+    )
+    Image.fromarray(to_uint8(img_full)).save(
+        os.path.join(out_dir, "sensitometry_page_full.png"))
+
+    print(f"  Rendering sensitometry_page_offset (offset_log_exposure=True)...")
+    img_offset = cr.render_sensitometry_page(
+        sensi_w, sensi_h, sensi_transformed,
+        stop_min=sensi_stop_min, stop_max=sensi_stop_max,
+        offset_log_exposure=True,
+    )
+    Image.fromarray(to_uint8(img_offset)).save(
+        os.path.join(out_dir, "sensitometry_page_offset.png"))
+
+    # Same three variants for Kodachrome 64 (Spectral K64 AWG4 LUT — needs LogC4 probe).
+    k64_lut_path = os.path.join(
+        os.path.dirname(script_dir),
+        "Spectral_K64_AWG4_sRGB.cube",
+    )
+    if os.path.exists(k64_lut_path):
+        k64_lut = cube_lut.CubeLUT.from_file(k64_lut_path)
+        print(f"Loaded LUT: K64 size={k64_lut.size}")
+        k64_probe = m.generate_probe_ramp(
+            probe_w, sensi_stop_min, sensi_stop_max,
+            encoding=m.ENCODING_LOGC4,
+        )
+        k64_transformed = k64_lut.apply(k64_probe)
+
+        print(f"  Rendering k64_sensitometry (clamped)...")
+        img = cr.render_sensitometry_page(
+            sensi_w, sensi_h, k64_transformed,
+            stop_min=sensi_stop_min, stop_max=sensi_stop_max,
+            title="Sensitometry — Kodachrome 64",
+        )
+        Image.fromarray(to_uint8(img)).save(
+            os.path.join(out_dir, "k64_sensitometry.png"))
+
+        print(f"  Rendering k64_sensitometry_full (show_entire_curve=True)...")
+        img = cr.render_sensitometry_page(
+            sensi_w, sensi_h, k64_transformed,
+            stop_min=sensi_stop_min, stop_max=sensi_stop_max,
+            show_entire_curve=True,
+            title="Sensitometry — Kodachrome 64",
+        )
+        Image.fromarray(to_uint8(img)).save(
+            os.path.join(out_dir, "k64_sensitometry_full.png"))
+
+        print(f"  Rendering k64_sensitometry_offset (offset_log_exposure=True)...")
+        img = cr.render_sensitometry_page(
+            sensi_w, sensi_h, k64_transformed,
+            stop_min=sensi_stop_min, stop_max=sensi_stop_max,
+            offset_log_exposure=True,
+            title="Sensitometry — Kodachrome 64",
+        )
+        Image.fromarray(to_uint8(img)).save(
+            os.path.join(out_dir, "k64_sensitometry_offset.png"))
+    else:
+        print(f"  (K64 LUT not found at {k64_lut_path}, skipping)")
+
+    # Same three variants for MSGenesisE100 (different LUT character).
+    msg_lut_path = os.path.join(
+        os.path.dirname(script_dir),
+        "MSGenesisE100_5.chart_arri_alexa_awg3_5600K00000001.cube",
+    )
+    if os.path.exists(msg_lut_path):
+        msg_lut = cube_lut.CubeLUT.from_file(msg_lut_path)
+        print(f"Loaded LUT: MSGenesisE100 size={msg_lut.size}")
+        msg_transformed = msg_lut.apply(sensi_probe)
+
+        print(f"  Rendering msgenesis_sensitometry (clamped)...")
+        img = cr.render_sensitometry_page(
+            sensi_w, sensi_h, msg_transformed,
+            stop_min=sensi_stop_min, stop_max=sensi_stop_max,
+            title="Sensitometry — MSGenesisE100",
+        )
+        Image.fromarray(to_uint8(img)).save(
+            os.path.join(out_dir, "msgenesis_sensitometry.png"))
+
+        print(f"  Rendering msgenesis_sensitometry_full (show_entire_curve=True)...")
+        img = cr.render_sensitometry_page(
+            sensi_w, sensi_h, msg_transformed,
+            stop_min=sensi_stop_min, stop_max=sensi_stop_max,
+            show_entire_curve=True,
+            title="Sensitometry — MSGenesisE100",
+        )
+        Image.fromarray(to_uint8(img)).save(
+            os.path.join(out_dir, "msgenesis_sensitometry_full.png"))
+
+        print(f"  Rendering msgenesis_sensitometry_offset (offset_log_exposure=True)...")
+        img = cr.render_sensitometry_page(
+            sensi_w, sensi_h, msg_transformed,
+            stop_min=sensi_stop_min, stop_max=sensi_stop_max,
+            offset_log_exposure=True,
+            title="Sensitometry — MSGenesisE100",
+        )
+        Image.fromarray(to_uint8(img)).save(
+            os.path.join(out_dir, "msgenesis_sensitometry_offset.png"))
+    else:
+        print(f"  (MSGenesisE100 LUT not found at {msg_lut_path}, skipping)")
 
     print(f"\nDone. Outputs in {out_dir}/")
     for f in sorted(os.listdir(out_dir)):

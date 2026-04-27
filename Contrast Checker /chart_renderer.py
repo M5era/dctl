@@ -50,31 +50,36 @@ def get_y_range(mode):
     }[mode]
 
 
-def get_x_range(mode, stop_min, stop_max, mid_gray=0.18, datasheet_offset=0.0):
+def get_x_range(mode, stop_min, stop_max, mid_gray=0.18, zero_lux_offset=0.0):
     """
     Default X-axis range (in display units) for each mode.
 
-    datasheet_offset: shift in log10(lux-seconds) units, only applied to
-    LOG_EXPOSURE mode. Use to align our X axis with Kodak datasheet absolute
-    exposure scale. For ISO N reversal film: offset ≈ log10(8 / N).
+    zero_lux_offset: shift in log10(lux-seconds) units, only applied to
+    LOG_EXPOSURE mode. Use to place 0 lux-seconds at the desired X position.
+    For ISO N reversal film: offset ≈ log10(8 / N).
     """
     if mode == X_MODE_STOPS:
         return (stop_min, stop_max)
     elif mode == X_MODE_LOG_EXPOSURE:
-        return (stop_min * np.log10(2.0) + datasheet_offset,
-                stop_max * np.log10(2.0) + datasheet_offset)
+        return (stop_min * np.log10(2.0) + zero_lux_offset,
+                stop_max * np.log10(2.0) + zero_lux_offset)
     else:  # LINEAR
         return (m.stops_to_linear(stop_min, mid_gray),
                 m.stops_to_linear(stop_max, mid_gray))
 
 
-def iso_to_datasheet_offset(iso):
+def iso_to_zero_lux_offset(iso):
     """
-    Convert a film ISO speed to a datasheet X-axis offset (log10 lux-seconds).
-    Uses the ISO speed-point convention H_ref ≈ 8 / ISO lux-sec for an 18%
-    reflectance reference. K64 → ~−0.903; E100 → ~−1.097; ISO 800 → −2.0.
+    Convert a film ISO speed to the log10 lux-seconds offset that places
+    0 lux-seconds at X=0. Uses the ISO speed-point convention H_ref ≈ 8 / ISO
+    lux-sec for an 18% reflectance reference.
     """
     return np.log10(8.0 / float(iso))
+
+
+def iso_to_datasheet_offset(iso):
+    """Backward-compatible alias for iso_to_zero_lux_offset."""
+    return iso_to_zero_lux_offset(iso)
 
 
 # -----------------------------------------------------------------------------
@@ -215,6 +220,50 @@ def measure_text_height(scale=1.0):
     return int(FONT_HEIGHT * scale)
 
 
+def draw_hline(img, y_px, x0, x1, color, thickness=1):
+    """Draw a horizontal line segment."""
+    h, w = img.shape[:2]
+    if y_px < 0 or y_px >= h:
+        return
+    xa = max(0, min(x0, x1))
+    xb = min(w - 1, max(x0, x1))
+    if xa > xb:
+        return
+    half = max(0, thickness // 2)
+    y0 = max(0, y_px - half)
+    y1 = min(h, y_px + half + 1)
+    img[y0:y1, xa:xb + 1] = color
+
+
+def draw_vline(img, x_px, y0, y1, color, thickness=1):
+    """Draw a vertical line segment."""
+    h, w = img.shape[:2]
+    if x_px < 0 or x_px >= w:
+        return
+    ya = max(0, min(y0, y1))
+    yb = min(h - 1, max(y0, y1))
+    if ya > yb:
+        return
+    half = max(0, thickness // 2)
+    x0 = max(0, x_px - half)
+    x1 = min(w, x_px + half + 1)
+    img[ya:yb + 1, x0:x1] = color
+
+
+def draw_rect_outline(img, x0, y0, x1, y1, color, thickness=1):
+    """Draw a rectangle outline."""
+    draw_hline(img, y0, x0, x1, color, thickness)
+    draw_hline(img, y1, x0, x1, color, thickness)
+    draw_vline(img, x0, y0, y1, color, thickness)
+    draw_vline(img, x1, y0, y1, color, thickness)
+
+
+def draw_text_centered(img, text, center_x, y_px, scale=1.0, color=(1.0, 1.0, 1.0)):
+    """Draw text centered around a given X position."""
+    w = measure_text(text, scale)
+    draw_text(img, text, int(center_x - w // 2), y_px, scale, color)
+
+
 def draw_text_rotated_ccw(img, text, x_px, y_px, scale=1.0, color=(1.0, 1.0, 1.0)):
     """
     Draw text rotated 90° counter-clockwise (reads bottom-to-top).
@@ -278,6 +327,83 @@ def fmt_x(value, x_mode):
 
 
 # -----------------------------------------------------------------------------
+# Sensitometry-curve helpers
+# -----------------------------------------------------------------------------
+
+def find_curve_clamp(transformed_ramp, threshold_frac=0.02):
+    """
+    Detect where a sensitometry curve is actively transitioning between its
+    plateau values (Dmin / Dmax). Returns (left_frac, right_frac) in [0, 1]
+    along the sample axis.
+
+    For each channel, the threshold is `threshold_frac` of (Dmax - Dmin). The
+    "active" range is where the curve has moved more than `threshold` away
+    from BOTH endpoint plateau values. Takes the union across channels so no
+    channel's transition gets cut off.
+    """
+    densities = m.output_to_density(np.asarray(transformed_ramp, dtype=np.float64))
+    if densities.ndim == 1:
+        densities = densities[:, None]
+    W = densities.shape[0]
+    if W < 2:
+        return 0.0, 1.0
+
+    left_indices = []
+    right_indices = []
+    for ch in range(densities.shape[1]):
+        d = densities[:, ch]
+        d_min = float(np.min(d))
+        d_max = float(np.max(d))
+        if d_max - d_min < 1e-3:
+            continue
+        thresh = threshold_frac * (d_max - d_min)
+        left_plateau = float(d[0])
+        right_plateau = float(d[-1])
+
+        deviates_left = np.abs(d - left_plateau) > thresh
+        if deviates_left.any():
+            left_indices.append(int(np.argmax(deviates_left)))
+
+        deviates_right = np.abs(d - right_plateau) > thresh
+        if deviates_right.any():
+            right_indices.append(int(W - 1 - np.argmax(deviates_right[::-1])))
+
+    if not left_indices or not right_indices:
+        return 0.0, 1.0
+    left_idx = min(left_indices)
+    right_idx = max(right_indices)
+    if right_idx <= left_idx:
+        return 0.0, 1.0
+    return left_idx / (W - 1), right_idx / (W - 1)
+
+
+def compute_equal_units_rect(left, top, right, bottom, x_span, y_span):
+    """
+    Inside the available rect, return a centred sub-rect such that
+    pixels-per-x-unit equals pixels-per-y-unit (i.e. one density unit and one
+    log-exposure unit cover the same pixel distance).
+    """
+    avail_w = right - left
+    avail_h = bottom - top
+    if avail_w <= 0 or avail_h <= 0 or x_span <= 0 or y_span <= 0:
+        return left, top, right, bottom
+
+    target_w = avail_h * x_span / y_span
+    if target_w <= avail_w:
+        plot_w = int(round(target_w))
+        plot_h = int(avail_h)
+    else:
+        plot_w = int(avail_w)
+        plot_h = int(round(avail_w * y_span / x_span))
+
+    plot_left = left + (avail_w - plot_w) // 2
+    plot_top = top + (avail_h - plot_h) // 2
+    plot_right = plot_left + plot_w
+    plot_bottom = plot_top + plot_h
+    return plot_left, plot_top, plot_right, plot_bottom
+
+
+# -----------------------------------------------------------------------------
 # Main chart renderer
 # -----------------------------------------------------------------------------
 
@@ -287,7 +413,7 @@ def render_chart(
     stop_min=-7.0, stop_max=5.0, mid_gray=0.18,
     x_mode=X_MODE_STOPS,
     y_mode=Y_MODE_PERCENT,
-    datasheet_offset=0.0,     # log10 lux-sec offset for X axis (LOG_EXPOSURE mode)
+    zero_lux_offset=0.0,      # log10 lux-sec offset for X axis (LOG_EXPOSURE mode)
     show_image=False,
     background_image=None,    # (H, W, 3) for show_image=True
     overlay_height_frac=1.0,  # 1.0 = fullscreen, 0.2 = bottom 20%
@@ -296,9 +422,9 @@ def render_chart(
     grid_major_color=(0.40, 0.40, 0.40),
     zero_color=(0.85, 0.65, 0.20),
     label_color=(0.85, 0.85, 0.85),
-    curve_thickness_px=2,
-    label_scale=1.8,        # tick labels (was 1.2)
-    title_scale=2.2,        # axis titles (X / Y legends)
+    curve_thickness_px=3,
+    label_scale=2.4,
+    title_scale=3.0,
     margin_left=130,
     margin_bottom=90,
     margin_top=30,
@@ -354,7 +480,7 @@ def render_chart(
 
     # Determine X / Y display ranges
     x_disp_min, x_disp_max = get_x_range(x_mode, stop_min, stop_max, mid_gray,
-                                         datasheet_offset)
+                                         zero_lux_offset)
     y_disp_min, y_disp_max = get_y_range(y_mode)
 
     # ---- Grid lines ----
@@ -369,12 +495,12 @@ def render_chart(
             continue
         px = plot_left + int(frac * plot_w)
         # "zero" detection: highlight the mid-grey reference column.
-        # In LOG_EXPOSURE mode the axis may be shifted by datasheet_offset, so
-        # mid-grey lands at tick == datasheet_offset, not tick == 0.
+        # In LOG_EXPOSURE mode the axis may be shifted by zero_lux_offset, so
+        # mid-grey lands at tick == zero_lux_offset, not tick == 0.
         is_zero = False
         if x_mode == X_MODE_STOPS and abs(tick) < 1e-6:
             is_zero = True
-        elif x_mode == X_MODE_LOG_EXPOSURE and abs(tick - datasheet_offset) < 1e-6:
+        elif x_mode == X_MODE_LOG_EXPOSURE and abs(tick - zero_lux_offset) < 1e-6:
             is_zero = True
         elif x_mode == X_MODE_LINEAR and abs(tick - mid_gray) < mid_gray * 0.05:
             is_zero = True
@@ -472,6 +598,263 @@ def render_chart(
     yt_anchor_x = max(4, plot_left - margin_left + 4)
     draw_text_rotated_ccw(img, y_title, yt_anchor_x, yt_anchor_y,
                           title_scale, label_color)
+
+    return img
+
+
+def render_sensitometry_page(
+    width, height,
+    transformed_ramp,
+    stop_min=-10.0, stop_max=6.0, mid_gray=0.18,
+    zero_lux_offset=0.0,
+    show_entire_curve=False,
+    clamp_threshold=0.02,
+    offset_log_exposure=False,
+    y_min=0.0, y_max=None,
+    pixels_per_unit=240,
+    page_bg=(1.0, 1.0, 1.0),
+    text_color=(0.10, 0.10, 0.10),
+    subtext_color=(0.22, 0.22, 0.22),
+    grid_color=(0.66, 0.66, 0.66),
+    border_color=(0.14, 0.14, 0.14),
+    curve_r_color=(0.90, 0.18, 0.18),
+    curve_g_color=(0.12, 0.60, 0.34),
+    curve_b_color=(0.24, 0.34, 0.72),
+    title="Sensitometry",
+    description_lines=None,
+    footer_lines=None,
+):
+    """
+    Render a Kodak-style sensitometry sheet:
+        Y = density, top X = log exposure, bottom X = camera stops.
+
+    The plot uses *equal units*: 1.0 in density and 1.0 in log exposure cover
+    the same pixel distance.
+
+    By default, the X range is clamped to the active part of the curve
+    (toe → shoulder), hiding the asymptotic plateaus. Pass
+    `show_entire_curve=True` to show the full input range.
+
+    `offset_log_exposure=True` shifts the log-exposure axis so the right
+    clamp position lands at 0. (Overrides `zero_lux_offset` when active.)
+    """
+    img = np.full((height, width, 3), page_bg, dtype=np.float64)
+
+    title_scale = 3.0
+    body_scale = 1.7
+    axis_title_scale = 2.8
+    tick_scale = 2.4
+    footer_scale = 1.55
+
+    if description_lines is None:
+        description_lines = [
+            "Density (Y) vs. log exposure (top X) is plotted with isotropic 1:1 scaling,",
+            "so 1.0 density unit and 1.0 decade of log exposure cover the same distance.",
+            "The bottom camera-stops axis is a convenience label (1 stop = log10(2) decade).",
+        ]
+    if footer_lines is None:
+        footer_lines = [
+            '"0" on the camera-stops axis marks the nominal exposure of an 18-percent gray card.',
+            "Positive values indicate more exposure; negative values indicate less.",
+        ]
+
+    # ---- Determine clamp window over the input ramp ----
+    full_stop_span = max(stop_max - stop_min, 1.0e-6)
+    if show_entire_curve:
+        clamp_left_frac, clamp_right_frac = 0.0, 1.0
+    else:
+        clamp_left_frac, clamp_right_frac = find_curve_clamp(
+            transformed_ramp, clamp_threshold
+        )
+    clamped_stop_min = stop_min + clamp_left_frac * full_stop_span
+    clamped_stop_max = stop_min + clamp_right_frac * full_stop_span
+    stop_span = max(clamped_stop_max - clamped_stop_min, 1.0e-6)
+
+    # Effective log-exposure offset.
+    log10_2 = np.log10(2.0)
+    if offset_log_exposure:
+        effective_offset = -clamped_stop_max * log10_2
+    else:
+        effective_offset = zero_lux_offset
+    log_min = clamped_stop_min * log10_2 + effective_offset
+    log_max = clamped_stop_max * log10_2 + effective_offset
+
+    # Auto y_max: round up curve max within clamp window to nearest 0.1, plus headroom.
+    probe_w = transformed_ramp.shape[0]
+    i_left = int(round(clamp_left_frac * (probe_w - 1)))
+    i_right = int(round(clamp_right_frac * (probe_w - 1)))
+    window_densities = m.output_to_density(transformed_ramp[i_left:i_right + 1])
+    curve_d_max = float(np.max(window_densities)) if window_densities.size else 1.0
+
+    if y_max is None:
+        y_max_auto = float(np.ceil((curve_d_max + 0.05) * 10.0) / 10.0)
+        y_max = max(y_max_auto, 0.5)
+    y_span = max(y_max - y_min, 1.0e-6)
+
+    # ---- Page header ----
+    page_margin_x = int(width * 0.055)
+    title_y = int(height * 0.035)
+    draw_text(img, title, page_margin_x, title_y, title_scale, text_color)
+
+    body_y = title_y + measure_text_height(title_scale) + 18
+    body_line_h = measure_text_height(body_scale) + 10
+    for line in description_lines:
+        draw_text(img, line, page_margin_x, body_y, body_scale, subtext_color)
+        body_y += body_line_h
+
+    footer_line_h = measure_text_height(footer_scale) + 10
+    footer_block_h = footer_line_h * len(footer_lines)
+    footer_y = height - int(height * 0.08) - footer_block_h
+
+    # Reserve enough vertical clearance above the plot for the top X-axis title
+    # ("LOG EXPOSURE …") AND its tick labels so they don't collide with the
+    # body description.
+    top_axis_clearance = (
+        measure_text_height(axis_title_scale)
+        + measure_text_height(tick_scale)
+        + 60
+    )
+    plot_avail_top = body_y + max(int(height * 0.06), top_axis_clearance)
+    plot_avail_bottom = footer_y - int(height * 0.09)
+    plot_avail_left = page_margin_x + int(width * 0.10)
+    plot_avail_right = width - page_margin_x - int(width * 0.04)
+    if plot_avail_right - plot_avail_left < 50 or plot_avail_bottom - plot_avail_top < 50:
+        return img
+
+    # Predetermined coordinate system: plot dimensions are derived from the
+    # axis ranges times a fixed pixels-per-unit. This guarantees isotropic
+    # 1:1 scaling (1 density unit = 1 log-exposure decade) by construction.
+    # If the resulting plot doesn't fit the page, scale uniformly to fit.
+    x_span_data = log_max - log_min
+    plot_w = int(round(x_span_data * pixels_per_unit))
+    plot_h = int(round(y_span * pixels_per_unit))
+    avail_w = plot_avail_right - plot_avail_left
+    avail_h = plot_avail_bottom - plot_avail_top
+    fit_scale = min(avail_w / max(plot_w, 1), avail_h / max(plot_h, 1), 1.0)
+    if fit_scale < 1.0:
+        plot_w = int(round(plot_w * fit_scale))
+        plot_h = int(round(plot_h * fit_scale))
+    plot_left = plot_avail_left + (avail_w - plot_w) // 2
+    plot_top = plot_avail_top + (avail_h - plot_h) // 2
+    plot_right = plot_left + plot_w
+    plot_bottom = plot_top + plot_h
+
+    def stop_to_px(stop_value):
+        frac = np.clip((stop_value - clamped_stop_min) / stop_span, 0.0, 1.0)
+        return plot_left + int(round(frac * plot_w))
+
+    def y_to_px(y_value):
+        frac = np.clip((y_value - y_min) / y_span, 0.0, 1.0)
+        return plot_bottom - int(round(frac * plot_h))
+
+    # ---- Plot border and Y grid ----
+    draw_rect_outline(img, plot_left, plot_top, plot_right, plot_bottom, border_color, thickness=3)
+    y_tick_step = 0.5 if y_span <= 2.5 else 1.0
+    tick = y_min
+    while tick <= y_max + 1.0e-6:
+        py = y_to_px(tick)
+        draw_hline(img, py, plot_left, plot_right, grid_color, thickness=1)
+        label = f"{tick:.1f}"
+        draw_text(
+            img, label,
+            plot_left - measure_text(label, tick_scale) - 18,
+            py - measure_text_height(tick_scale) // 2,
+            tick_scale, text_color,
+        )
+        tick += y_tick_step
+
+    # ---- Top log-exposure ticks (0.5-decade minor grid, integer major + label) ----
+    minor_grid_color = tuple(min(1.0, c + 0.18) for c in grid_color)
+    half_start = int(np.ceil(log_min * 2.0))
+    half_end = int(np.floor(log_max * 2.0))
+    for half in range(half_start, half_end + 1):
+        log_tick = half * 0.5
+        stop_tick = (log_tick - effective_offset) / log10_2
+        if stop_tick < clamped_stop_min - 1.0e-6 or stop_tick > clamped_stop_max + 1.0e-6:
+            continue
+        px = stop_to_px(stop_tick)
+        is_integer = (half % 2) == 0
+        col = grid_color if is_integer else minor_grid_color
+        draw_vline(img, px, plot_top, plot_bottom, col, thickness=1)
+        if is_integer:
+            draw_text_centered(
+                img, f"{int(log_tick):d}", px,
+                plot_top - measure_text_height(tick_scale) - 16,
+                tick_scale, text_color,
+            )
+
+    # ---- Bottom camera-stops ticks ----
+    minor_tick_h = max(10, plot_h // 18)
+    major_tick_h = max(18, plot_h // 9)
+    minor_tick_start = int(np.ceil(clamped_stop_min))
+    minor_tick_end = int(np.floor(clamped_stop_max))
+    for stop_tick in range(minor_tick_start, minor_tick_end + 1):
+        px = stop_to_px(float(stop_tick))
+        is_major = (stop_tick % 2) == 0
+        tick_h = major_tick_h if is_major else minor_tick_h
+        draw_vline(img, px, plot_bottom - tick_h, plot_bottom, grid_color, thickness=1)
+        if is_major:
+            draw_text_centered(
+                img, f"{stop_tick:d}", px,
+                plot_bottom + 18,
+                tick_scale, text_color,
+            )
+
+    # ---- Curves (sample only the clamped sub-window of the ramp) ----
+    sub_count = max(i_right - i_left + 1, 2)
+    curve_points = [[], [], []]
+    for px in range(plot_left, plot_right + 1):
+        chart_x_norm = (px - plot_left) / plot_w
+        probe_idx_f = i_left + chart_x_norm * (sub_count - 1)
+        i0 = int(np.floor(probe_idx_f))
+        i1 = min(i0 + 1, probe_w - 1)
+        f = probe_idx_f - i0
+        rgb = transformed_ramp[i0] * (1.0 - f) + transformed_ramp[i1] * f
+        curve_points[0].append((px, y_to_px(output_to_y_display(rgb[0], Y_MODE_DENSITY))))
+        curve_points[1].append((px, y_to_px(output_to_y_display(rgb[1], Y_MODE_DENSITY))))
+        curve_points[2].append((px, y_to_px(output_to_y_display(rgb[2], Y_MODE_DENSITY))))
+
+    def draw_curve(points, color):
+        thickness = 5
+        for px, py in points:
+            for dy in range(-thickness // 2, thickness // 2 + 1):
+                yy = py + dy
+                if plot_top <= yy <= plot_bottom:
+                    img[yy, px] = color
+
+    draw_curve(curve_points[2], curve_b_color)
+    draw_curve(curve_points[1], curve_g_color)
+    draw_curve(curve_points[0], curve_r_color)
+
+    # ---- Axis titles ----
+    log_title = "LOG EXPOSURE  (decades, isotropic with density)"
+    if offset_log_exposure:
+        log_title = "LOG EXPOSURE  (decades, zeroed at right clamp)"
+    draw_text_centered(
+        img, log_title,
+        (plot_left + plot_right) // 2,
+        plot_top - measure_text_height(tick_scale) - measure_text_height(axis_title_scale) - 34,
+        axis_title_scale, subtext_color,
+    )
+    draw_text_centered(
+        img, "CAMERA STOPS  (1 stop = 0.301 dec, not isotropic)",
+        (plot_left + plot_right) // 2,
+        plot_bottom + 18 + measure_text_height(tick_scale) + 26,
+        axis_title_scale, subtext_color,
+    )
+    density_w = measure_text("DENSITY", axis_title_scale)
+    draw_text_rotated_ccw(
+        img, "DENSITY",
+        max(10, plot_left - int(width * 0.085)),
+        (plot_top + plot_bottom) // 2 + density_w // 2,
+        axis_title_scale, subtext_color,
+    )
+
+    # ---- Footer ----
+    y = footer_y
+    for line in footer_lines:
+        draw_text(img, line, page_margin_x, y, footer_scale, subtext_color)
+        y += footer_line_h
 
     return img
 
