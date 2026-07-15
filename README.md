@@ -1,23 +1,42 @@
 # custom_dctls
 
-Custom DCTLs for DaVinci Resolve, built around **HD Curve** — a characteristic-curve
-scope for grading and film-emulation work.
+Custom DCTLs for DaVinci Resolve — my personal collection of color and
+film-emulation tools. New tools get added here over time.
+
+## Contents
+
+- [Installation](#installation)
+- [HD Curve](#hd-curve) — live characteristic-curve (H&D) scope
+- [Yedlin Grain](#yedlin-grain) — film grain plugin
+- [Reference material](#reference-material)
+
+## Installation
+
+Copy the `.dctl` files into the Resolve LUT folder and refresh the LUT list
+(right-click the node's LUT menu → Refresh, or restart Resolve):
+
+- **macOS:** `/Library/Application Support/Blackmagic Design/DaVinci Resolve/LUT/`
+- **Windows:** `%PROGRAMDATA%\Blackmagic Design\DaVinci Resolve\Support\LUT\`
+
+Apply a DCTL by adding the **DCTL** ResolveFX plugin to a node and selecting the
+file, or via the node's LUT dropdown. Tooltips need Resolve 19.1+.
+
+---
+
+## HD Curve
 
 ![HD Curve Display](docs/hd-curve.png)
 
 *HD Curve measuring an ARRI ALEXA → 500T negative → 2383 print chain, plotted
 as output % vs. camera stops / log exposure.*
 
-## HD Curve
-
-A two-node measurement tool that plots the characteristic curve (H&D curve) of
-everything between two points of a node tree — LUTs, CSTs, curves, full film
-emulation chains — live, per channel, against a photometrically meaningful axis
-system.
+A two-node scope that plots the characteristic curve (H&D curve) of everything
+between two points of a node tree — LUTs, CSTs, curves, full film-emulation
+chains — live, per channel, against a photometrically meaningful axis system.
 
 **Current pairing: `HD Curve Probe_v2.3.dctl` ↔ `HD Curve Display_v2.23.dctl`.**
-The two versions belong together; the Probe Encoding setting must match on both
-nodes.
+The two versions belong together, and the Probe Encoding setting must match on
+both nodes.
 
 ### How it works
 
@@ -25,22 +44,11 @@ The probe renders a thin synthetic grayscale strip along the bottom of the
 frame, sweeping exposure in stops around 18% mid gray and encoding it with the
 selected camera transfer function. Everything downstream processes that strip
 like real footage. The display node samples the strip's bottom row and plots
-input exposure (x) against the processed output (y).
+input exposure (x) against processed output (y).
 
 ```
 [01 Probe] -> CST -> grade -> FilmOut LUT -> ... -> [last node: Display]
 ```
-
-### Install
-
-Copy both DCTLs into the Resolve LUT folder and refresh the LUT list:
-
-```
-/Library/Application Support/Blackmagic Design/DaVinci Resolve/LUT/
-```
-
-Apply via the ResolveFX **DCTL** plugin: probe on the first node, display on the
-last. Requires a recent Resolve (tooltips need 19.1+).
 
 ### Probe
 
@@ -98,26 +106,33 @@ or cascaded neg+print curves); spatial nodes (halation, grain, blur) contaminate
 the synthetic strip — bypass them for exact reads; and the strip must reach the
 display node intact (no crops/resizes of the bottom rows in between).
 
-### Folder contents
+The `HD Curve/` folder also contains `Sensitometry Curve Display/Probe.dctl`
+(the predecessor these were built from) and Python tooling (`hd_math.py`,
+`chart_renderer.py`, `cube_lut.py`, `preview.py`, `test_hd_math.py`) for
+previewing and testing the math outside Resolve.
 
-- `HD Curve Display_v2.23.dctl`, `HD Curve Probe_v2.3.dctl` — the tool.
-- `Sensitometry Curve Display/Probe.dctl` — predecessor; its active-range
-  detection and sensitometry layout were ported into HD Curve.
-- `hd_math.py`, `chart_renderer.py`, `cube_lut.py`, `preview.py`,
-  `test_hd_math.py` — Python tooling for previewing/testing the math outside
-  Resolve.
+---
 
-## Other DCTLs
+## Yedlin Grain
 
-- `grain_plugin_v3.dctl` — film grain plugin.
+`grain_plugin_v3.dctl` — a film grain plugin combining point-based stochastic
+noise with subtle domain warping for a particulate, non-digital character.
+Controls: Grain Amount, Grain Size, Grit, Chroma Separation, Highlight
+Protection, Shadow Response, Seed.
+
+---
+
+## Reference material
+
 - `thatcher-freeman/` — utilities by
-  [Thatcher Freeman](https://github.com/thatcherfreeman) (Exposure Chart,
-  Exposure Strip, Film Curve) kept for reference; the HD Curve text renderer is
-  based on the bitmap-font approach from these tools.
-- `*.cube` — reference LUTs used for testing.
+  [Thatcher Freeman](https://github.com/thatcherfreeman/utility-dctls)
+  (Exposure Chart, Exposure Strip, Film Curve), kept for reference. HD Curve's
+  bitmap-font text renderer is based on the approach in these tools.
+- `*.cube` — reference LUTs used for testing (film-match and print emulations).
 
-## Versioning
+## Conventions
 
-Each functional change ships as a new `_vX.Y` file; superseded versions are
-deleted (history lives in git). Probe and display versions are paired — check
-the header comment of each file for its changelog.
+Each functional change to a tool ships as a new `_vX.Y` file; superseded
+versions are deleted (history lives in git). Paired tools (like HD Curve's probe
+and display) are versioned together — check the header comment of each file for
+its changelog.
