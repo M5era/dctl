@@ -3,9 +3,10 @@
 Custom DCTLs for DaVinci Resolve, built around **HD Curve** — a characteristic-curve
 scope for grading and film-emulation work.
 
-<!-- Screenshot: drop an image at docs/hd-curve.png and uncomment:
 ![HD Curve Display](docs/hd-curve.png)
--->
+
+*HD Curve measuring an ARRI ALEXA → 500T negative → 2383 print chain, plotted
+as output % vs. camera stops / log exposure.*
 
 ## HD Curve
 
