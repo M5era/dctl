@@ -1,0 +1,177 @@
+#line 2
+
+// HD Curve - Probe (v2.3)
+// Put this on the first node.
+// The display DCTL samples the bottom row of the generated strip.
+//
+// v2.3 changes:
+// - Tooltips on the controls (requires Resolve 19.1+; ignored below that).
+//
+// v2.2 changes:
+// - Greyscale Height % defaults to 0.5 (a minimal strip; the display only
+//   samples the bottom row anyway).
+//
+// v2.1 changes:
+// - LogC4 corrected to the official ARRI LogC4 specification (May 2022):
+//   18% mid gray now encodes to 0.278 as documented by ARRI. The previous
+//   formula was non-standard and put mid gray at 0.407.
+//   Verified mid gray code values: LogC3 0.391, LogC4 0.278, DI 0.336.
+// - Stop ranges are now symmetric around mid gray: the same number of stops
+//   above and below, bounded by where the curve clips at code 1.0, capped at
+//   +-10 stops:
+//     ARRI LogC3:           -8.2574 .. +8.2574  (clips at +8.2574)
+//     ARRI LogC4:           -10.0   .. +10.0    (clips at +11.35; capped)
+//     DaVinci Intermediate: -9.1178 .. +9.1178  (clips at +9.1178, linear 100)
+//   IMPORTANT: keep Probe Encoding in sync with the display DCTL (v2.4+).
+//
+// v2.0 changes:
+// - Added DaVinci Intermediate (DWG) encoding.
+// - The strip sweeps the dynamic range of the chosen transfer function
+//   instead of a fixed -8..+8.
+
+#define PROBE_MID_GRAY 0.18f
+#define PROBE_MIN_BAND_PX 3
+
+#define ENCODING_LOGC3 0
+#define ENCODING_LOGC4 1
+#define ENCODING_DI 2
+
+// Stop range of the strip for each encoding, relative to 18% mid gray:
+// symmetric around mid gray, bounded by the encoding's clip point at code
+// 1.0, capped at +-10 stops. Must match the display DCTL.
+#define STOPS_LOGC3_MIN -8.2574f
+#define STOPS_LOGC3_MAX 8.2574f
+#define STOPS_LOGC4_MIN -10.0f
+#define STOPS_LOGC4_MAX 10.0f
+#define STOPS_DI_MIN -9.1178f
+#define STOPS_DI_MAX 9.1178f
+
+DEFINE_UI_PARAMS(encoding, Probe Encoding, DCTLUI_COMBO_BOX, 0, {ENCODING_LOGC3, ENCODING_LOGC4, ENCODING_DI}, {ARRI LogC3, ARRI LogC4, DaVinci Intermediate})
+DEFINE_UI_PARAMS(probe_height_pct, Greyscale Height %, DCTLUI_SLIDER_FLOAT, 0.5, 0.5, 100.0, 0.5)
+
+DEFINE_UI_TOOLTIP(Probe Encoding, "Transfer function of the generated strip - use the encoding your node chain expects as input. Must match the Probe Encoding on the display DCTL.")
+DEFINE_UI_TOOLTIP(Greyscale Height %, "Height of the grayscale strip at the bottom of the frame. The display samples only the bottom pixel row, so the minimum is fine.")
+
+#define LOGC3_CUT 0.010591f
+#define LOGC3_A 5.555556f
+#define LOGC3_B 0.052272f
+#define LOGC3_C 0.247190f
+#define LOGC3_D 0.385537f
+#define LOGC3_E 5.367655f
+#define LOGC3_F 0.092809f
+
+// Official ARRI LogC4 constants (spec of May 2022):
+// a = (2^18 - 16) / 117.45, b = (1023 - 95) / 1023, c = 95 / 1023,
+// s and t define the linear segment below t.
+#define LOGC4_A 2231.8263091f
+#define LOGC4_B 0.9071358749f
+#define LOGC4_C 0.0928641251f
+#define LOGC4_S 0.1135972086f
+#define LOGC4_T -0.0180569961f
+
+#define DI_A 0.0075f
+#define DI_B 7.0f
+#define DI_C 0.07329248f
+#define DI_M 10.44426855f
+#define DI_LIN_CUT 0.00262409f
+
+__DEVICE__ int clamp_int(int value, int lo, int hi) {
+    if (value < lo) {
+        return lo;
+    }
+    if (value > hi) {
+        return hi;
+    }
+    return value;
+}
+
+__DEVICE__ int round_to_int(float value) {
+    return (int)_floor(value + 0.5f);
+}
+
+__DEVICE__ int probe_band_height_px(int p_Height, float height_pct) {
+    int band_px = round_to_int((height_pct * 0.01f) * (float)p_Height);
+    if (band_px < PROBE_MIN_BAND_PX) {
+        band_px = PROBE_MIN_BAND_PX;
+    }
+    return clamp_int(band_px, 1, p_Height);
+}
+
+__DEVICE__ float probe_stop_min_for(int probe_encoding) {
+    if (probe_encoding == ENCODING_LOGC4) {
+        return STOPS_LOGC4_MIN;
+    }
+    if (probe_encoding == ENCODING_DI) {
+        return STOPS_DI_MIN;
+    }
+    return STOPS_LOGC3_MIN;
+}
+
+__DEVICE__ float probe_stop_max_for(int probe_encoding) {
+    if (probe_encoding == ENCODING_LOGC4) {
+        return STOPS_LOGC4_MAX;
+    }
+    if (probe_encoding == ENCODING_DI) {
+        return STOPS_DI_MAX;
+    }
+    return STOPS_LOGC3_MAX;
+}
+
+__DEVICE__ float stops_to_linear(float stops) {
+    return PROBE_MID_GRAY * _exp2f(stops);
+}
+
+__DEVICE__ float linear_to_logc3(float x) {
+    if (x >= LOGC3_CUT) {
+        return LOGC3_C * _log10f(LOGC3_A * x + LOGC3_B) + LOGC3_D;
+    }
+    return LOGC3_E * x + LOGC3_F;
+}
+
+// Official ARRI LogC4 encode: 18% mid gray -> 0.278.
+__DEVICE__ float linear_to_logc4(float x) {
+    if (x < LOGC4_T) {
+        return (x - LOGC4_T) / LOGC4_S;
+    }
+    return (LOGC4_B * (_log2f(LOGC4_A * x + 64.0f) - 6.0f)) / 14.0f + LOGC4_C;
+}
+
+__DEVICE__ float linear_to_di(float x) {
+    if (x > DI_LIN_CUT) {
+        return (_log2f(x + DI_A) + DI_B) * DI_C;
+    }
+    return x * DI_M;
+}
+
+__DEVICE__ float encode_probe_value(float linear_value, int probe_encoding) {
+    if (probe_encoding == ENCODING_LOGC4) {
+        return linear_to_logc4(linear_value);
+    }
+    if (probe_encoding == ENCODING_DI) {
+        return linear_to_di(linear_value);
+    }
+    return linear_to_logc3(linear_value);
+}
+
+__DEVICE__ float3 transform(int p_Width, int p_Height, int p_X, int p_Y, float p_R, float p_G, float p_B) {
+    float3 passthrough = make_float3(p_R, p_G, p_B);
+
+    int band_px = probe_band_height_px(p_Height, probe_height_pct);
+    int band_top = p_Height - band_px;
+    if (p_Y < band_top) {
+        return passthrough;
+    }
+
+    float x_norm = 0.0f;
+    if (p_Width > 1) {
+        x_norm = (float)p_X / (float)(p_Width - 1);
+    }
+    x_norm = _clampf(x_norm, 0.0f, 1.0f);
+
+    float stop_min = probe_stop_min_for(encoding);
+    float stop_max = probe_stop_max_for(encoding);
+    float stops = stop_min + x_norm * (stop_max - stop_min);
+    float probe_code = encode_probe_value(stops_to_linear(stops), encoding);
+
+    return make_float3(probe_code, probe_code, probe_code);
+}
