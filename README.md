@@ -128,7 +128,8 @@ Protection, Shadow Response, Seed.
   [Thatcher Freeman](https://github.com/thatcherfreeman/utility-dctls)
   (Exposure Chart, Exposure Strip, Film Curve), kept for reference. HD Curve's
   bitmap-font text renderer is based on the approach in these tools.
-- `*.cube` — reference LUTs used for testing (film-match and print emulations).
+- `LUTs/` — reference `.cube` LUTs used for testing (film-match and print
+  emulations).
 
 ## Conventions
 
